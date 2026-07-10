@@ -6,10 +6,43 @@ from docling_core.types.doc import ImageRefMode
 from docling_core.types.doc.document import DocTagsDocument, DoclingDocument
 from mlx_vlm import load, stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.tokenizer_utils import BPEStreamingDetokenizer
 from mlx_vlm.utils import load_config
 
 DEFAULT_MODEL = "ibm-granite/granite-docling-258M-mlx"
 PROMPT = "Convert this page to docling."
+
+
+class Utf8SafeBPEStreamingDetokenizer(BPEStreamingDetokenizer):
+    """Work around mlx-vlm failing on malformed generated UTF-8 bytes."""
+
+    def add_token(self, token, skip_special_token_ids=None):
+        if skip_special_token_ids is None:
+            skip_special_token_ids = []
+        if token in skip_special_token_ids:
+            return
+
+        value = self.tokenmap[token]
+        if self._byte_decoder[value[0]] == 32:
+            current_text = bytes(
+                self._byte_decoder[char] for char in self._unflushed
+            ).decode("utf-8", errors="ignore")
+            if self.text or not self.trim_space:
+                self.text += current_text
+            else:
+                self.text += current_text.removeprefix(" ")
+            self._unflushed = value
+        else:
+            self._unflushed += value
+
+
+def make_detokenizer_utf8_safe(processor) -> None:
+    detokenizer = processor.detokenizer
+    if isinstance(detokenizer, BPEStreamingDetokenizer):
+        tokenizer = getattr(processor, "tokenizer", processor)
+        processor.detokenizer = Utf8SafeBPEStreamingDetokenizer(
+            tokenizer, trim_space=detokenizer.trim_space
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +117,7 @@ def convert_pdf(pdf_path: Path, output_dir: Path, dpi: int, model_path: str) -> 
     print(f"Loading model {model_path}...")
     model, processor = load(model_path)
     config = load_config(model_path)
+    make_detokenizer_utf8_safe(processor)
 
     outputs = generate_doctags(model, processor, config, page_images)
     doctags_doc = DocTagsDocument.from_doctags_and_image_pairs(
