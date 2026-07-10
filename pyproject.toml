@@ -7,4 +7,5 @@ requires-python = ">=3.13"
 dependencies = [
     "docling>=2.111.0",
     "mlx-vlm>=0.6.4",
+    "pypdfium2>=5.11.0",
 ]

@@ -865,12 +865,14 @@ source = { virtual = "." }
 dependencies = [
     { name = "docling" },
     { name = "mlx-vlm" },
+    { name = "pypdfium2" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "docling", specifier = ">=2.111.0" },
     { name = "mlx-vlm", specifier = ">=0.6.4" },
+    { name = "pypdfium2", specifier = ">=5.11.0" },
 ]
 
 [[package]]
