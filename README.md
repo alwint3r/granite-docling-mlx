@@ -51,6 +51,20 @@ granite-docling input.pdf --output-dir output
 granite-docling input.pdf --output-dir output --model /path/to/granite-docling-258M-mlx
 ```
 
+The converter processes and saves one page at a time. For `input.pdf`, the
+Markdown files are named `input-page-0001.md`, `input-page-0002.md`, and so on.
+Each file links to its adjacent pages. Extracted figures are stored below
+`output/figures/page-0001/`, grouped by source page.
+
+The converter also compares tables at adjacent page boundaries. A repeated,
+aligned table receives a **Likely continuation** link; an explicit source label
+such as “Table 4 (continued)” receives a **Continued** link. These annotations
+are navigational only: tables are not merged across files.
+
+Only the model, the current rendered page, and lightweight metadata from the
+previous page remain in memory. Completed pages are therefore released rather
+than accumulating for the full PDF.
+
 The bundle includes the Python runtime and application dependencies, but not
 the Granite model weights. The default model downloads from Hugging Face into
 the user's cache on first use.
@@ -59,4 +73,5 @@ the user's cache on first use.
 
 ```bash
 uv run main.py input.pdf --output-dir output
+uv run python -m unittest discover -s tests
 ```
