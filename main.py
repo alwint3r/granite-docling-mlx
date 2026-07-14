@@ -1,6 +1,7 @@
 import argparse
 import gc
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -59,7 +60,6 @@ class TableBoundary:
 @dataclass(frozen=True)
 class PageSummary:
     page_number: int
-    markdown_path: Path
     top_tables: tuple[TableBoundary, ...]
     bottom_tables: tuple[TableBoundary, ...]
 
@@ -70,6 +70,21 @@ class Continuation:
     next_table: TableBoundary
     confidence: float
     confirmed: bool
+
+
+@dataclass(frozen=True)
+class PendingDocumentPage:
+    page_number: int
+    markdown: str
+    summary: PageSummary
+    incoming_continuations: tuple[Continuation, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConversionResult:
+    page_count: int
+    output_mode: str
+    markdown_destination: Path
 
 
 class Utf8SafeBPEStreamingDetokenizer(BPEStreamingDetokenizer):
@@ -104,11 +119,11 @@ def make_detokenizer_utf8_safe(processor) -> None:
         )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert each PDF page to Markdown, extract detected figures, and "
-            "link likely cross-page tables."
+            "Convert a PDF to Markdown, extract detected figures, and link "
+            "likely cross-page tables."
         )
     )
     parser.add_argument("pdf", type=Path, help="PDF file to process")
@@ -117,7 +132,16 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         required=True,
-        help="Directory for per-page Markdown files and extracted figures",
+        help="Directory for Markdown output and extracted figures",
+    )
+    parser.add_argument(
+        "--output-mode",
+        choices=("pages", "document"),
+        default="document",
+        help=(
+            "write one file per page or one file for the whole document "
+            "(default: document)"
+        ),
     )
     parser.add_argument(
         "--dpi",
@@ -130,7 +154,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MODEL,
         help=f"MLX model path or Hugging Face model ID (default: {DEFAULT_MODEL})",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def page_markdown_path(
@@ -203,11 +227,11 @@ def leading_table_text(table: TableItem, row_limit: int = 2) -> str:
 
 
 def summarize_page(
-    document: DoclingDocument, page_number: int, markdown_path: Path
+    document: DoclingDocument, page_number: int
 ) -> PageSummary:
     page = document.pages.get(1)
     if page is None or page.size.width <= 0 or page.size.height <= 0:
-        return PageSummary(page_number, markdown_path, (), ())
+        return PageSummary(page_number, (), ())
 
     top_tables = []
     bottom_tables = []
@@ -233,7 +257,6 @@ def summarize_page(
 
     return PageSummary(
         page_number=page_number,
-        markdown_path=markdown_path,
         top_tables=tuple(top_tables),
         bottom_tables=tuple(bottom_tables),
     )
@@ -363,33 +386,49 @@ def continuation_label(continuation: Continuation) -> str:
     return "Continued" if continuation.confirmed else "Likely continuation"
 
 
-def annotate_continuations(
+def outgoing_continuation_markdown(
+    continuations: Sequence[Continuation], target_page: int, target_href: str
+) -> str:
+    return "\n\n".join(
+        f"> **{continuation_label(continuation)}:** A table on this page "
+        f"continues on [page {target_page}]({target_href})."
+        for continuation in continuations
+    )
+
+
+def incoming_continuation_markdown(
+    continuations: Sequence[Continuation], source_page: int, source_href: str
+) -> str:
+    return "\n\n".join(
+        f"> **{continuation_label(continuation)}:** A table from "
+        f"[page {source_page}]({source_href}) continues on this page."
+        for continuation in continuations
+    )
+
+
+def annotate_page_continuations(
     previous: PageSummary,
     current: PageSummary,
+    previous_path: Path,
+    current_path: Path,
     continuations: list[Continuation],
 ) -> None:
     if not continuations:
         return
 
-    outgoing = []
-    incoming = []
-    for continuation in continuations:
-        label = continuation_label(continuation)
-        outgoing.append(
-            f"> **{label}:** A table on this page continues on "
-            f"[page {current.page_number}]({current.markdown_path.name})."
-        )
-        incoming.append(
-            f"> **{label}:** A table from "
-            f"[page {previous.page_number}]({previous.markdown_path.name}) "
-            "continues on this page."
-        )
-
     replace_annotation_marker(
-        previous.markdown_path, CONTINUATION_TO_MARKER, "\n\n".join(outgoing)
+        previous_path,
+        CONTINUATION_TO_MARKER,
+        outgoing_continuation_markdown(
+            continuations, current.page_number, current_path.name
+        ),
     )
     replace_annotation_marker(
-        current.markdown_path, CONTINUATION_FROM_MARKER, "\n\n".join(incoming)
+        current_path,
+        CONTINUATION_FROM_MARKER,
+        incoming_continuation_markdown(
+            continuations, previous.page_number, previous_path.name
+        ),
     )
 
 
@@ -402,14 +441,84 @@ def replace_annotation_marker(path: Path, marker: str, annotation: str) -> None:
     path.write_text(markdown.replace(marker, replacement, 1), encoding="utf-8")
 
 
-def convert_pdf(pdf_path: Path, output_dir: Path, dpi: int, model_path: str) -> int:
-    pdf = pdfium.PdfDocument(pdf_path)
+def document_navigation_markdown(page_number: int, page_count: int) -> str:
+    links = []
+    if page_number > 1:
+        links.append(f"[← Page {page_number - 1}](#page-{page_number - 1})")
+    links.append(f"Page {page_number} of {page_count}")
+    if page_number < page_count:
+        links.append(f"[Page {page_number + 1} →](#page-{page_number + 1})")
+    return " · ".join(links)
+
+
+def render_document_page(
+    pending: PendingDocumentPage,
+    outgoing_continuations: Sequence[Continuation],
+    page_count: int,
+) -> str:
+    page_number = pending.page_number
+    sections = [
+        f'<a id="page-{page_number}"></a>',
+        document_navigation_markdown(page_number, page_count),
+    ]
+    if pending.incoming_continuations:
+        sections.append(
+            incoming_continuation_markdown(
+                pending.incoming_continuations,
+                page_number - 1,
+                f"#page-{page_number - 1}",
+            )
+        )
+    if pending.markdown.strip():
+        sections.append(pending.markdown.strip())
+    if outgoing_continuations:
+        sections.append(
+            outgoing_continuation_markdown(
+                outgoing_continuations,
+                page_number + 1,
+                f"#page-{page_number + 1}",
+            )
+        )
+    sections.append(document_navigation_markdown(page_number, page_count))
+    if page_number < page_count:
+        sections.append("<!-- PDF page break -->")
+    return "\n\n".join(sections) + "\n\n"
+
+
+def export_page_markdown(
+    document: DoclingDocument, markdown_path: Path, artifacts_dir: Path
+) -> str:
+    document.save_as_markdown(
+        markdown_path,
+        artifacts_dir=artifacts_dir,
+        image_mode=ImageRefMode.REFERENCED,
+    )
+    return markdown_path.read_text(encoding="utf-8")
+
+
+def convert_pdf(
+    pdf_path: Path,
+    output_dir: Path,
+    dpi: int,
+    model_path: str,
+    output_mode: str,
+) -> ConversionResult:
+    if output_mode not in {"pages", "document"}:
+        raise ValueError(f"Unsupported output mode: {output_mode}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    document_path = output_dir / f"{pdf_path.stem}.md"
+    document_temp_path = output_dir / f".{pdf_path.stem}.md.tmp"
+    document_published = False
+    pdf = None
     try:
+        if output_mode == "document":
+            document_temp_path.write_text("", encoding="utf-8")
+
+        pdf = pdfium.PdfDocument(pdf_path)
         page_count = len(pdf)
         if page_count == 0:
             raise ValueError("The PDF contains no pages.")
-
-        output_dir.mkdir(parents=True, exist_ok=True)
         digits = max(4, len(str(page_count)))
 
         print(f"Loading model {model_path}...")
@@ -421,6 +530,8 @@ def convert_pdf(pdf_path: Path, output_dir: Path, dpi: int, model_path: str) -> 
         )
 
         previous_summary = None
+        previous_markdown_path = None
+        pending_document_page = None
         for page_index in range(page_count):
             page_number = page_index + 1
             page = pdf[page_index]
@@ -444,43 +555,97 @@ def convert_pdf(pdf_path: Path, output_dir: Path, dpi: int, model_path: str) -> 
                 doctags_doc,
                 document_name=f"{pdf_path.stem}-page-{page_number}",
             )
-
-            markdown_path = page_markdown_path(
-                pdf_path, output_dir, page_number, digits
-            )
+            current_summary = summarize_page(document, page_number)
             artifacts_dir = Path("figures") / f"page-{page_number:0{digits}d}"
-            document.save_as_markdown(
-                markdown_path,
-                artifacts_dir=artifacts_dir,
-                image_mode=ImageRefMode.REFERENCED,
-            )
-            markdown = markdown_path.read_text(encoding="utf-8")
-            navigation = navigation_markdown(
-                page_number, page_count, pdf_path.stem, digits
-            )
-            markdown_path.write_text(
-                wrap_page_markdown(markdown, navigation), encoding="utf-8"
-            )
 
-            current_summary = summarize_page(
-                document, page_number, markdown_path
-            )
-            if previous_summary is not None:
-                continuations = detect_table_continuations(
-                    previous_summary, current_summary
+            if output_mode == "pages":
+                markdown_path = page_markdown_path(
+                    pdf_path, output_dir, page_number, digits
                 )
-                annotate_continuations(
-                    previous_summary, current_summary, continuations
+                markdown = export_page_markdown(
+                    document, markdown_path, artifacts_dir
+                )
+                navigation = navigation_markdown(
+                    page_number, page_count, pdf_path.stem, digits
+                )
+                markdown_path.write_text(
+                    wrap_page_markdown(markdown, navigation), encoding="utf-8"
                 )
 
-            previous_summary = current_summary
+                if previous_summary is not None:
+                    assert previous_markdown_path is not None
+                    continuations = detect_table_continuations(
+                        previous_summary, current_summary
+                    )
+                    annotate_page_continuations(
+                        previous_summary,
+                        current_summary,
+                        previous_markdown_path,
+                        markdown_path,
+                        continuations,
+                    )
+                previous_summary = current_summary
+                previous_markdown_path = markdown_path
+            else:
+                page_temp_path = output_dir / (
+                    f".{pdf_path.stem}-page-{page_number:0{digits}d}.export.tmp.md"
+                )
+                try:
+                    markdown = export_page_markdown(
+                        document, page_temp_path, artifacts_dir
+                    )
+                finally:
+                    page_temp_path.unlink(missing_ok=True)
+
+                current_pending_page = PendingDocumentPage(
+                    page_number=page_number,
+                    markdown=markdown,
+                    summary=current_summary,
+                )
+                if pending_document_page is not None:
+                    continuations = detect_table_continuations(
+                        pending_document_page.summary, current_summary
+                    )
+                    current_pending_page = PendingDocumentPage(
+                        page_number=page_number,
+                        markdown=markdown,
+                        summary=current_summary,
+                        incoming_continuations=tuple(continuations),
+                    )
+                    with document_temp_path.open("a", encoding="utf-8") as fp:
+                        fp.write(
+                            render_document_page(
+                                pending_document_page,
+                                continuations,
+                                page_count,
+                            )
+                        )
+                pending_document_page = current_pending_page
+
             del document, doctags_doc, output, page_image
             gc.collect()
             mx.clear_cache()
-    finally:
-        pdf.close()
 
-    return page_count
+        if output_mode == "document":
+            assert pending_document_page is not None
+            with document_temp_path.open("a", encoding="utf-8") as fp:
+                fp.write(
+                    render_document_page(pending_document_page, (), page_count)
+                )
+            document_temp_path.replace(document_path)
+            document_published = True
+    finally:
+        if pdf is not None:
+            pdf.close()
+        if output_mode == "document" and not document_published:
+            document_temp_path.unlink(missing_ok=True)
+
+    markdown_destination = document_path if output_mode == "document" else output_dir
+    return ConversionResult(
+        page_count=page_count,
+        output_mode=output_mode,
+        markdown_destination=markdown_destination,
+    )
 
 
 def main() -> None:
@@ -493,13 +658,20 @@ def main() -> None:
     if args.dpi <= 0:
         raise SystemExit("error: --dpi must be greater than zero")
 
-    page_count = convert_pdf(
+    result = convert_pdf(
         pdf_path=args.pdf,
         output_dir=args.output_dir,
         dpi=args.dpi,
         model_path=args.model,
+        output_mode=args.output_mode,
     )
-    print(f"Saved {page_count} Markdown page(s) to: {args.output_dir}")
+    if result.output_mode == "pages":
+        print(
+            f"Saved {result.page_count} Markdown page(s) to: "
+            f"{result.markdown_destination}"
+        )
+    else:
+        print(f"Markdown saved to: {result.markdown_destination}")
     print(f"Figures saved to: {args.output_dir / 'figures'}")
 
 
