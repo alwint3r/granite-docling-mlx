@@ -67,6 +67,17 @@ The available modes are:
 - `pages` saves each completed page immediately and links it to adjacent page
   files.
 
+Use `--page-range` to process only an inclusive, 1-based range of source pages:
+
+```bash
+granite-docling input.pdf --output-dir output --page-range 10-20
+```
+
+A single page can be selected with a single number, such as `--page-range 10`.
+Source page numbers are retained in headings, links, figure directories, and
+per-page filenames. Navigation is limited to the selected pages. A range whose
+last page exceeds the PDF page count is rejected.
+
 In both modes, extracted figures are grouped by source page under directories
 such as `output/figures/page-0001/`. The converter compares tables at adjacent
 page boundaries. A repeated, aligned table receives a **Likely continuation**

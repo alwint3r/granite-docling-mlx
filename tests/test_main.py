@@ -204,6 +204,46 @@ class CliArgumentTests(unittest.TestCase):
                 ]
             )
 
+    def test_page_range_is_inclusive_and_one_based(self):
+        args = parse_args(
+            [
+                "input.pdf",
+                "--output-dir",
+                "output",
+                "--page-range",
+                "3-7",
+            ]
+        )
+
+        self.assertEqual(args.page_range, (3, 7))
+
+    def test_single_page_can_be_selected(self):
+        args = parse_args(
+            [
+                "input.pdf",
+                "--output-dir",
+                "output",
+                "--page-range",
+                "5",
+            ]
+        )
+
+        self.assertEqual(args.page_range, (5, 5))
+
+    def test_invalid_page_ranges_are_rejected(self):
+        for page_range in ("0-2", "4-2", "two-five", "1-"):
+            with self.subTest(page_range=page_range):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    parse_args(
+                        [
+                            "input.pdf",
+                            "--output-dir",
+                            "output",
+                            "--page-range",
+                            page_range,
+                        ]
+                    )
+
 
 class DocumentMarkdownTests(unittest.TestCase):
     def test_document_page_uses_internal_navigation_and_continuation_links(self):
@@ -267,8 +307,11 @@ class DocumentMarkdownTests(unittest.TestCase):
 
 
 class OutputModeIntegrationTests(unittest.TestCase):
-    def make_pdf(self, path: Path) -> None:
-        pages = [Image.new("RGB", (200, 300), "white") for _ in range(2)]
+    def make_pdf(self, path: Path, page_count: int = 2) -> None:
+        pages = [
+            Image.new("RGB", (200, 300), "white")
+            for _ in range(page_count)
+        ]
         pages[0].save(
             path,
             "PDF",
@@ -335,6 +378,81 @@ class OutputModeIntegrationTests(unittest.TestCase):
             self.assertEqual(document_result.markdown_destination, document_files[0])
             self.assertEqual(pages_result.markdown_destination, pages_output)
             self.assertFalse(any(document_output.glob("*.tmp.md")))
+
+    def test_page_range_only_converts_selected_source_pages(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            pdf_path = directory / "sample.pdf"
+            self.make_pdf(pdf_path, page_count=3)
+            document_output = directory / "document"
+            pages_output = directory / "pages"
+
+            patches = self.conversion_patches()
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                document_result = convert_pdf(
+                    pdf_path,
+                    document_output,
+                    dpi=72,
+                    model_path="test-model",
+                    output_mode="document",
+                    page_range=(2, 3),
+                )
+                pages_result = convert_pdf(
+                    pdf_path,
+                    pages_output,
+                    dpi=72,
+                    model_path="test-model",
+                    output_mode="pages",
+                    page_range=(2, 3),
+                )
+
+            self.assertEqual(
+                sorted(pages_output.glob("*.md")),
+                [
+                    pages_output / "sample-page-0002.md",
+                    pages_output / "sample-page-0003.md",
+                ],
+            )
+            document_markdown = (document_output / "sample.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("Test page 1", document_markdown)
+            self.assertIn("Test page 2", document_markdown)
+            self.assertIn("Test page 3", document_markdown)
+            self.assertNotIn("#page-1", document_markdown)
+            self.assertNotIn("#page-4", document_markdown)
+
+            first_page_markdown = (
+                pages_output / "sample-page-0002.md"
+            ).read_text(encoding="utf-8")
+            last_page_markdown = (
+                pages_output / "sample-page-0003.md"
+            ).read_text(encoding="utf-8")
+            self.assertNotIn("sample-page-0001.md", first_page_markdown)
+            self.assertNotIn("sample-page-0004.md", last_page_markdown)
+            self.assertEqual(document_result.page_count, 2)
+            self.assertEqual(pages_result.page_count, 2)
+
+    def test_page_range_cannot_exceed_pdf_page_count(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            pdf_path = directory / "sample.pdf"
+            self.make_pdf(pdf_path)
+
+            with (
+                patch("main.load") as load_model,
+                self.assertRaisesRegex(ValueError, "exceeds the PDF"),
+            ):
+                convert_pdf(
+                    pdf_path,
+                    directory / "output",
+                    dpi=72,
+                    model_path="test-model",
+                    output_mode="document",
+                    page_range=(2, 3),
+                )
+
+            load_model.assert_not_called()
 
     def test_failed_document_conversion_preserves_existing_output(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

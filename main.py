@@ -32,6 +32,7 @@ EXPLICIT_CONTINUATION_RE = re.compile(
 
 CONTINUATION_FROM_MARKER = "<!-- continuation-from -->\n<!-- /continuation-from -->"
 CONTINUATION_TO_MARKER = "<!-- continuation-to -->\n<!-- /continuation-to -->"
+PAGE_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,24 @@ def make_detokenizer_utf8_safe(processor) -> None:
         )
 
 
+def parse_page_range(value: str) -> tuple[int, int]:
+    match = PAGE_RANGE_RE.fullmatch(value.strip())
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            "must be a page number or inclusive range such as 3-7"
+        )
+
+    first_page = int(match.group(1))
+    last_page = int(match.group(2) or first_page)
+    if first_page < 1:
+        raise argparse.ArgumentTypeError("page numbers must be greater than zero")
+    if last_page < first_page:
+        raise argparse.ArgumentTypeError(
+            "the last page must be greater than or equal to the first page"
+        )
+    return first_page, last_page
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -141,6 +160,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "write one file per page or one file for the whole document "
             "(default: document)"
+        ),
+    )
+    parser.add_argument(
+        "--page-range",
+        type=parse_page_range,
+        metavar="START-END",
+        help=(
+            "process an inclusive, 1-based page range, or one page "
+            "(for example: 3-7 or 5)"
         ),
     )
     parser.add_argument(
@@ -359,14 +387,22 @@ def detect_table_continuations(
 
 
 def navigation_markdown(
-    page_number: int, page_count: int, pdf_stem: str, digits: int
+    page_number: int,
+    page_count: int,
+    pdf_stem: str,
+    digits: int,
+    first_page: int = 1,
+    last_page: int | None = None,
 ) -> str:
+    if last_page is None:
+        last_page = page_count
+
     links = []
-    if page_number > 1:
+    if page_number > first_page:
         previous_name = f"{pdf_stem}-page-{page_number - 1:0{digits}d}.md"
         links.append(f"[← Page {page_number - 1}]({previous_name})")
     links.append(f"Page {page_number} of {page_count}")
-    if page_number < page_count:
+    if page_number < last_page:
         next_name = f"{pdf_stem}-page-{page_number + 1:0{digits}d}.md"
         links.append(f"[Page {page_number + 1} →]({next_name})")
     return " · ".join(links)
@@ -441,12 +477,20 @@ def replace_annotation_marker(path: Path, marker: str, annotation: str) -> None:
     path.write_text(markdown.replace(marker, replacement, 1), encoding="utf-8")
 
 
-def document_navigation_markdown(page_number: int, page_count: int) -> str:
+def document_navigation_markdown(
+    page_number: int,
+    page_count: int,
+    first_page: int = 1,
+    last_page: int | None = None,
+) -> str:
+    if last_page is None:
+        last_page = page_count
+
     links = []
-    if page_number > 1:
+    if page_number > first_page:
         links.append(f"[← Page {page_number - 1}](#page-{page_number - 1})")
     links.append(f"Page {page_number} of {page_count}")
-    if page_number < page_count:
+    if page_number < last_page:
         links.append(f"[Page {page_number + 1} →](#page-{page_number + 1})")
     return " · ".join(links)
 
@@ -455,11 +499,18 @@ def render_document_page(
     pending: PendingDocumentPage,
     outgoing_continuations: Sequence[Continuation],
     page_count: int,
+    first_page: int = 1,
+    last_page: int | None = None,
 ) -> str:
+    if last_page is None:
+        last_page = page_count
+
     page_number = pending.page_number
     sections = [
         f'<a id="page-{page_number}"></a>',
-        document_navigation_markdown(page_number, page_count),
+        document_navigation_markdown(
+            page_number, page_count, first_page, last_page
+        ),
     ]
     if pending.incoming_continuations:
         sections.append(
@@ -479,8 +530,12 @@ def render_document_page(
                 f"#page-{page_number + 1}",
             )
         )
-    sections.append(document_navigation_markdown(page_number, page_count))
-    if page_number < page_count:
+    sections.append(
+        document_navigation_markdown(
+            page_number, page_count, first_page, last_page
+        )
+    )
+    if page_number < last_page:
         sections.append("<!-- PDF page break -->")
     return "\n\n".join(sections) + "\n\n"
 
@@ -502,6 +557,7 @@ def convert_pdf(
     dpi: int,
     model_path: str,
     output_mode: str,
+    page_range: tuple[int, int] | None = None,
 ) -> ConversionResult:
     if output_mode not in {"pages", "document"}:
         raise ValueError(f"Unsupported output mode: {output_mode}")
@@ -519,6 +575,16 @@ def convert_pdf(
         page_count = len(pdf)
         if page_count == 0:
             raise ValueError("The PDF contains no pages.")
+
+        first_page, last_page = page_range or (1, page_count)
+        if first_page < 1 or last_page < first_page:
+            raise ValueError(f"Invalid page range: {first_page}-{last_page}")
+        if last_page > page_count:
+            raise ValueError(
+                f"Page range {first_page}-{last_page} exceeds the PDF's "
+                f"{page_count} page(s)."
+            )
+        selected_page_count = last_page - first_page + 1
         digits = max(4, len(str(page_count)))
 
         print(f"Loading model {model_path}...")
@@ -532,8 +598,8 @@ def convert_pdf(
         previous_summary = None
         previous_markdown_path = None
         pending_document_page = None
-        for page_index in range(page_count):
-            page_number = page_index + 1
+        for page_number in range(first_page, last_page + 1):
+            page_index = page_number - 1
             page = pdf[page_index]
             try:
                 page_image = page.render(scale=dpi / 72).to_pil().convert("RGB")
@@ -566,7 +632,12 @@ def convert_pdf(
                     document, markdown_path, artifacts_dir
                 )
                 navigation = navigation_markdown(
-                    page_number, page_count, pdf_path.stem, digits
+                    page_number,
+                    page_count,
+                    pdf_path.stem,
+                    digits,
+                    first_page,
+                    last_page,
                 )
                 markdown_path.write_text(
                     wrap_page_markdown(markdown, navigation), encoding="utf-8"
@@ -618,6 +689,8 @@ def convert_pdf(
                                 pending_document_page,
                                 continuations,
                                 page_count,
+                                first_page,
+                                last_page,
                             )
                         )
                 pending_document_page = current_pending_page
@@ -630,7 +703,13 @@ def convert_pdf(
             assert pending_document_page is not None
             with document_temp_path.open("a", encoding="utf-8") as fp:
                 fp.write(
-                    render_document_page(pending_document_page, (), page_count)
+                    render_document_page(
+                        pending_document_page,
+                        (),
+                        page_count,
+                        first_page,
+                        last_page,
+                    )
                 )
             document_temp_path.replace(document_path)
             document_published = True
@@ -642,7 +721,7 @@ def convert_pdf(
 
     markdown_destination = document_path if output_mode == "document" else output_dir
     return ConversionResult(
-        page_count=page_count,
+        page_count=selected_page_count,
         output_mode=output_mode,
         markdown_destination=markdown_destination,
     )
@@ -658,13 +737,18 @@ def main() -> None:
     if args.dpi <= 0:
         raise SystemExit("error: --dpi must be greater than zero")
 
-    result = convert_pdf(
-        pdf_path=args.pdf,
-        output_dir=args.output_dir,
-        dpi=args.dpi,
-        model_path=args.model,
-        output_mode=args.output_mode,
-    )
+    try:
+        result = convert_pdf(
+            pdf_path=args.pdf,
+            output_dir=args.output_dir,
+            dpi=args.dpi,
+            model_path=args.model,
+            output_mode=args.output_mode,
+            page_range=args.page_range,
+        )
+    except ValueError as error:
+        raise SystemExit(f"error: {error}") from None
+
     if result.output_mode == "pages":
         print(
             f"Saved {result.page_count} Markdown page(s) to: "
