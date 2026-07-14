@@ -45,25 +45,45 @@ only `granite-docling`; move the full bundle directory instead.
 
 ## Usage
 
+By default, the converter writes the entire PDF to one Markdown file:
+
 ```bash
 granite-docling input.pdf --output-dir output
-# or use a previously downloaded local model
-granite-docling input.pdf --output-dir output --model /path/to/granite-docling-258M-mlx
+# creates output/input.md
 ```
 
-The converter processes and saves one page at a time. For `input.pdf`, the
-Markdown files are named `input-page-0001.md`, `input-page-0002.md`, and so on.
-Each file links to its adjacent pages. Extracted figures are stored below
-`output/figures/page-0001/`, grouped by source page.
+To write one Markdown file per PDF page, select `pages` mode:
 
-The converter also compares tables at adjacent page boundaries. A repeated,
-aligned table receives a **Likely continuation** link; an explicit source label
-such as “Table 4 (continued)” receives a **Continued** link. These annotations
-are navigational only: tables are not merged across files.
+```bash
+granite-docling input.pdf --output-dir output --output-mode pages
+# creates output/input-page-0001.md, output/input-page-0002.md, ...
+```
 
-Only the model, the current rendered page, and lightweight metadata from the
-previous page remain in memory. Completed pages are therefore released rather
-than accumulating for the full PDF.
+The available modes are:
+
+- `document` (default) assembles one `input.md` file with internal page anchors
+  and previous/next page links. The complete file is published atomically after
+  conversion finishes.
+- `pages` saves each completed page immediately and links it to adjacent page
+  files.
+
+In both modes, extracted figures are grouped by source page under directories
+such as `output/figures/page-0001/`. The converter compares tables at adjacent
+page boundaries. A repeated, aligned table receives a **Likely continuation**
+link; an explicit source label such as “Table 4 (continued)” receives a
+**Continued** link. These annotations are navigational only: tables are not
+merged.
+
+Both modes retain only the model, the current rendered page, one pending page's
+Markdown, and lightweight boundary metadata. Rendered pages therefore do not
+accumulate in memory as the PDF grows.
+
+Use `--model` to select previously downloaded local model weights:
+
+```bash
+granite-docling input.pdf --output-dir output \
+  --model /path/to/granite-docling-258M-mlx
+```
 
 The bundle includes the Python runtime and application dependencies, but not
 the Granite model weights. The default model downloads from Hugging Face into
